@@ -6,6 +6,11 @@ Desde la carpeta raíz de tu workspace (`ros2_ws`), ejecuta:
 
 ```bash
 colcon build --packages-select hikvision_ros2_driver
+```
+
+Setear env
+
+```bash
 source install/setup.sh
 export LD_LIBRARY_PATH=~/ros2_ws/src/hikvision_ros2_driver/third_party/hikvision/lib:$LD_LIBRARY_PATH
 ```
