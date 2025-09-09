@@ -1,5 +1,19 @@
 # hikvision_ros2_driver
 
+## Cómo compilar solo este paquete
+
+Desde la carpeta raíz de tu workspace (`ros2_ws`), ejecuta:
+
+```bash
+colcon build --packages-select hikvision_ros2_driver
+source install/setup.sh
+export LD_LIBRARY_PATH=~/ros2_ws/src/hikvision_ros2_driver/third_party/hikvision/lib:$LD_LIBRARY_PATH
+```
+
+Esto compilará únicamente el paquete `hikvision_ros2_driver` y sus dependencias necesarias.
+
+---
+
 Este proyecto proporciona un conjunto de nodos ROS2 para la integración y captura de video desde cámaras Hikvision, facilitando la adquisición y procesamiento de imágenes en sistemas robóticos.
 
 ## Estructura del proyecto
@@ -87,4 +101,4 @@ Recuerda que, tras lanzar los nodos, debes invocar los servicios mencionados par
 ## Notas adicionales
 
 - Revisa el archivo `package.xml` y `CMakeLists.txt` para detalles sobre dependencias y configuración.
-- Los logs generados se almacenan en la carpeta `log/`.
+- Los logs generados se almacenan en la carpeta

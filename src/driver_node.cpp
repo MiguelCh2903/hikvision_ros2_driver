@@ -229,7 +229,6 @@ private:
 
     if (last_time_cam1_.nanoseconds() > 0 && last_time_cam2_.nanoseconds() > 0) {
       double delta_ms = std::abs((last_time_cam1_ - last_time_cam2_).nanoseconds()) / 1e6;
-      // RCLCPP_INFO(this->get_logger(), "Timestamp delta between cameras: %.2f ms", delta_ms);
     }
   }
 
