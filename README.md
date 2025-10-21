@@ -8,14 +8,15 @@ Desde la carpeta raíz de tu workspace (`ros2_ws`), ejecuta:
 colcon build --packages-select hikvision_ros2_driver
 ```
 
-Setear env
+## Configuración del entorno
+
+Después de compilar, solo necesitas sourcear el setup:
 
 ```bash
-source install/setup.sh
-export LD_LIBRARY_PATH=~/ros2_ws/src/hikvision_ros2_driver/third_party/hikvision/lib:$LD_LIBRARY_PATH
+source install/setup.bash
 ```
 
-Esto compilará únicamente el paquete `hikvision_ros2_driver` y sus dependencias necesarias.
+Las librerías de Hikvision se instalan automáticamente en el workspace, por lo que ya no es necesario configurar manualmente el `LD_LIBRARY_PATH`.
 
 ---
 
@@ -107,3 +108,47 @@ Recuerda que, tras lanzar los nodos, debes invocar los servicios mencionados par
 
 - Revisa el archivo `package.xml` y `CMakeLists.txt` para detalles sobre dependencias y configuración.
 - Los logs generados se almacenan en la carpeta
+
+## Parámetros de calibración de cámaras
+
+### Cámara Izquierda (Left Camera)
+
+**Matriz de cámara (Camera Matrix):**
+```yaml
+left_camera_matrix:
+  - [1571.8274485379468, 0.0, 1249.6694603195083]
+  - [0.0, 1575.9598273120064, 750.6778820969588]
+  - [0.0, 0.0, 1.0]
+```
+
+**Coeficientes de distorsión (Distortion Coefficients):**
+```yaml
+left_distortion_coefficients:
+  - [-0.35262583654991225, 0.1800948838208316, -0.000770386070305207, -0.00014062951365452944, -0.06748934647152573]
+```
+
+### Cámara Derecha (Right Camera)
+
+**Matriz de cámara (Camera Matrix):**
+```yaml
+right_camera_matrix:
+  - [1561.9905505514428, 0.0, 1252.1852035921543]
+  - [0.0, 1567.541622051507, 758.2859120251709]
+  - [0.0, 0.0, 1.0]
+```
+
+**Coeficientes de distorsión (Distortion Coefficients):**
+```yaml
+right_distortion_coefficients:
+  - [-0.3397013201284959, 0.16325369157507694, -0.0008762542630270343, -0.0005334133198146973, -0.06085011032557315]
+```
+
+### Formato de los parámetros
+
+- **Camera Matrix (K)**: Matriz 3x3 con los parámetros intrínsecos de la cámara
+  - `fx, fy`: Distancias focales en píxeles
+  - `cx, cy`: Coordenadas del punto principal (centro óptico)
+  
+- **Distortion Coefficients (D)**: Vector de 5 elementos con el modelo de distorsión radial-tangencial
+  - `k1, k2, k3`: Coeficientes de distorsión radial
+  - `p1, p2`: Coeficientes de distorsión tangencial
