@@ -13,11 +13,20 @@
 #include <mutex>
 #include <thread>
 #include <condition_variable>
+#include <future>
+#include <deque>
 
 struct FrameData {
     std::vector<uint8_t> buffer;
     int width;
     int height;
+    rclcpp::Time capture_time;  // Timestamp de captura para mejor sincronización
+};
+
+struct CameraStats {
+    std::atomic<uint64_t> frames_received{0};
+    std::atomic<uint64_t> frames_dropped_queue_full{0};
+    std::atomic<uint64_t> frames_published{0};
 };
 
 class HikvisionCamera {
@@ -26,7 +35,6 @@ public:
                   const std::string &password,
                   rclcpp::Node::SharedPtr node_ptr,
                   const std::string &topic_name,
-                  double target_fps = 20.0,
                   int jpeg_quality = 85,
                   bool use_compressed = true,
                   bool is_left_camera = true)
@@ -35,19 +43,22 @@ public:
         playHandle_(-1),
         port_(-1),
         processing_thread_running_(true),
-        target_fps_(target_fps),
-        frame_interval_ns_(static_cast<uint64_t>(1e9 / target_fps)),
-        last_published_time_(0, 0, RCL_ROS_TIME),
         jpeg_quality_(jpeg_quality),
         use_compressed_(use_compressed),
         is_left_camera_(is_left_camera) {
 
-    // QoS optimizado para sensores en tiempo real (cámaras + lidar)
-    // BEST_EFFORT: reduce latencia y evita acumulación en redes congestionadas
-    auto qos = rclcpp::QoS(10)
-        .reliability(RMW_QOS_POLICY_RELIABILITY_BEST_EFFORT)
+    // QoS optimizado para rosbag y cero pérdida de paquetes
+    // - RELIABLE: garantiza entrega (compatible con RViz2)
+    // - History depth 50: buffer grande para absorber picos de tráfico
+    // - Deadline 100ms: detecta publicadores lentos
+    // - Liveliness 3s: detecta desconexiones
+    auto qos = rclcpp::QoS(50)  // Buffer grande para rosbag
+        .reliability(RMW_QOS_POLICY_RELIABILITY_RELIABLE)
         .durability(RMW_QOS_POLICY_DURABILITY_VOLATILE)
-        .history(RMW_QOS_POLICY_HISTORY_KEEP_LAST);
+        .history(RMW_QOS_POLICY_HISTORY_KEEP_LAST)
+        .deadline(std::chrono::milliseconds(100))  // Alertar si publicación > 100ms
+        .liveliness(RMW_QOS_POLICY_LIVELINESS_AUTOMATIC)
+        .liveliness_lease_duration(std::chrono::seconds(3));
 
     if (use_compressed_) {
       compressed_pub_ = node_->create_publisher<sensor_msgs::msg::CompressedImage>(
@@ -58,6 +69,23 @@ public:
 
     camera_info_pub_ = node_->create_publisher<sensor_msgs::msg::CameraInfo>(
         topic_name + "/camera_info", qos);
+
+    // Timer para reportar solo problemas críticos (pérdida por cola llena)
+    stats_timer_ = node_->create_wall_timer(
+        std::chrono::seconds(10),
+        [this, topic_name]() {
+          uint64_t dropped_queue = stats_.frames_dropped_queue_full.load();
+          
+          // Solo reportar si hay frames descartados por cola llena (problema real)
+          if (dropped_queue > 0) {
+            RCLCPP_WARN(node_->get_logger(),
+                        "[%s] Queue overflow: %lu frames dropped",
+                        topic_name.c_str(), dropped_queue);
+          }
+        });
+
+    // Optimización: configurar OpenCV threads una sola vez
+    cv::setNumThreads(2);  // 2 threads para operaciones paralelas (cvtColor, etc)
 
     if (!PlayM4_GetPort(&port_)) {
       RCLCPP_ERROR(node_->get_logger(), "PlayM4_GetPort failed for %s", ip.c_str());
@@ -88,7 +116,13 @@ public:
     clientInfo.lLinkMode = 0;
     clientInfo.hPlayWnd = 0;
 
+    // Iniciar thread de procesamiento principal
     processing_thread_ = std::thread(&HikvisionCamera::processFrames, this);
+    
+    // Iniciar thread pool para procesamiento paralelo (2 workers por cámara)
+    for (int i = 0; i < 2; ++i) {
+      worker_threads_.emplace_back(&HikvisionCamera::workerThread, this);
+    }
 
     playHandle_ = NET_DVR_RealPlay_V30(userID_, &clientInfo, FrameCallback, this, TRUE);
 
@@ -121,16 +155,27 @@ private:
     dvrTime.dwSecond = timeinfo->tm_sec;
 
     if (!NET_DVR_SetDVRConfig(userID_, NET_DVR_SET_TIMECFG, 0, &dvrTime, sizeof(dvrTime))) {
-      RCLCPP_WARN(node_->get_logger(), "Failed to sync camera time: error %d", 
-                  NET_DVR_GetLastError());
+      // Silenciar warning - la sincronización de tiempo no es crítica
     }
   }
 
   void stopProcessing() {
     processing_thread_running_ = false;
+    
+    // Notificar a todos los threads
     cv_.notify_all();
+    work_cv_.notify_all();
+    
+    // Esperar thread principal
     if (processing_thread_.joinable()) {
       processing_thread_.join();
+    }
+    
+    // Esperar workers del thread pool
+    for (auto& worker : worker_threads_) {
+      if (worker.joinable()) {
+        worker.join();
+      }
     }
   }
 
@@ -156,6 +201,7 @@ private:
   }
 
   void processFrames() {
+    // Thread principal: distribuye frames a workers para procesamiento paralelo
     while (processing_thread_running_) {
       std::unique_lock<std::mutex> lock(queue_mutex_);
       cv_.wait(lock, [this] { return !frame_queue_.empty() || !processing_thread_running_; });
@@ -166,39 +212,54 @@ private:
       frame_queue_.pop();
       lock.unlock();
 
-      // Control de FPS usando tiempo ROS
-      if (!shouldPublishFrame()) {
-        continue;
-      }
+      // Publicar todos los frames a FPS nativo de la cámara (~50 FPS)
+      // Sin control de FPS artificial para máxima fluidez
 
-      publishFrame(frame);
+      // Enviar frame a la cola de trabajo para procesamiento asíncrono
+      {
+        std::lock_guard<std::mutex> work_lock(work_mutex_);
+        work_queue_.push_back(std::move(frame));
+      }
+      work_cv_.notify_one();
     }
   }
 
-  bool shouldPublishFrame() {
-    rclcpp::Time current_time = node_->now();
-    
-    if (last_published_time_.nanoseconds() != 0) {
-      uint64_t elapsed_ns = (current_time - last_published_time_).nanoseconds();
-      if (elapsed_ns < frame_interval_ns_) {
-        return false;
+  void workerThread() {
+    // Worker thread: procesa frames de forma asíncrona y paralela
+    while (processing_thread_running_) {
+      FrameData frame;
+      
+      {
+        std::unique_lock<std::mutex> lock(work_mutex_);
+        work_cv_.wait(lock, [this] { 
+          return !work_queue_.empty() || !processing_thread_running_; 
+        });
+        
+        if (!processing_thread_running_ && work_queue_.empty()) break;
+        if (work_queue_.empty()) continue;
+        
+        frame = std::move(work_queue_.front());
+        work_queue_.pop_front();
       }
+
+      // Procesamiento intensivo (cvtColor + JPEG) en paralelo
+      publishFrame(frame);
+      stats_.frames_published++;
     }
-    
-    last_published_time_ = current_time;
-    return true;
   }
 
   void publishFrame(const FrameData &frame) {
     try {
+      // Conversión YV12 a BGR optimizada con OpenCV paralelo
       cv::Mat yv12(frame.height * 3 / 2, frame.width, CV_8UC1, 
                    const_cast<uint8_t*>(frame.buffer.data()));
       cv::Mat bgr;
+      
+      // OpenCV usa automáticamente los threads configurados en el constructor
       cv::cvtColor(yv12, bgr, cv::COLOR_YUV2BGR_YV12);
 
-      // Usar tiempo ROS actual para sincronización con otros sensores (lidar, IMU)
-      // Esto garantiza compatibilidad con rosbag y message_filters
-      rclcpp::Time stamp = node_->now();
+      // Usar timestamp de captura para mejor sincronización temporal
+      rclcpp::Time stamp = frame.capture_time;
 
       if (use_compressed_) {
         publishCompressedImage(bgr, stamp);
@@ -219,8 +280,19 @@ private:
     msg->header.frame_id = "camera_link";
     msg->format = "jpeg";
 
-    std::vector<int> params = {cv::IMWRITE_JPEG_QUALITY, jpeg_quality_};
-    cv::imencode(".jpg", bgr, msg->data, params);
+    // Buffer thread-local reutilizable para evitar allocations
+    thread_local std::vector<uint8_t> jpeg_buffer;
+    jpeg_buffer.clear();  // Limpiar pero mantener capacidad
+    
+    // Optimizar JPEG encoding: usar optimización rápida
+    std::vector<int> params = {
+      cv::IMWRITE_JPEG_QUALITY, jpeg_quality_,
+      cv::IMWRITE_JPEG_OPTIMIZE, 0,  // Desactivar optimización extra (más rápido)
+      cv::IMWRITE_JPEG_PROGRESSIVE, 0  // JPEG baseline (más rápido)
+    };
+    cv::imencode(".jpg", bgr, jpeg_buffer, params);
+    
+    msg->data = std::move(jpeg_buffer);  // Mover en lugar de copiar
 
     compressed_pub_->publish(*msg);
   }
@@ -302,7 +374,7 @@ private:
 
   static void CALLBACK ExceptionCallback(DWORD dwType, LONG lUserID, LONG lHandle, void *pUser) {
     auto *camera = static_cast<HikvisionCamera *>(pUser);
-    RCLCPP_ERROR(camera->node_->get_logger(), "SDK Exception - Type: %u, Handle: %d", dwType, lHandle);
+    RCLCPP_ERROR(camera->node_->get_logger(), "Camera exception: %u", dwType);
   }
 
   static void CALLBACK FrameCallback(LONG, DWORD dwDataType, BYTE *pBuffer, DWORD dwBufSize, void *pUser) {
@@ -330,18 +402,26 @@ private:
     auto *camera = reinterpret_cast<HikvisionCamera *>(nUser);
     if (!camera || !pBuf || !pFrameInfo || pFrameInfo->nType != T_YV12) return;
 
+    camera->stats_.frames_received++;
+
     FrameData frame;
     frame.width = pFrameInfo->nWidth;
     frame.height = pFrameInfo->nHeight;
+    frame.capture_time = camera->node_->now();  // Capturar timestamp inmediatamente
     
+    // Pre-alocar buffer con tamaño exacto para evitar re-allocations
     int data_size = frame.height * frame.width * 3 / 2;
+    frame.buffer.reserve(data_size);
     frame.buffer.resize(data_size);
     memcpy(frame.buffer.data(), pBuf, data_size);
 
     std::lock_guard<std::mutex> lock(camera->queue_mutex_);
     
-    if (camera->frame_queue_.size() >= 5) {
-      camera->frame_queue_.pop();
+    // Aumentar cola de 5 a 30 frames para manejar picos de tráfico
+    // Esto previene pérdida de frames durante procesamiento lento temporal
+    if (camera->frame_queue_.size() >= 30) {
+      camera->frame_queue_.pop();  // Descartar el más antiguo
+      camera->stats_.frames_dropped_queue_full++;
     }
     
     camera->frame_queue_.push(std::move(frame));
@@ -352,23 +432,29 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr image_pub_;
   rclcpp::Publisher<sensor_msgs::msg::CompressedImage>::SharedPtr compressed_pub_;
   rclcpp::Publisher<sensor_msgs::msg::CameraInfo>::SharedPtr camera_info_pub_;
+  rclcpp::TimerBase::SharedPtr stats_timer_;
   
   LONG userID_;
   LONG playHandle_;
   LONG port_;
   
-  double target_fps_;
-  uint64_t frame_interval_ns_;
-  rclcpp::Time last_published_time_;
   int jpeg_quality_;
   bool use_compressed_;
   bool is_left_camera_;
   
+  CameraStats stats_;
+  
   std::thread processing_thread_;
+  std::vector<std::thread> worker_threads_;  // Thread pool para procesamiento paralelo
   std::atomic<bool> processing_thread_running_;
-  std::queue<FrameData> frame_queue_;
+  
+  std::queue<FrameData> frame_queue_;  // Cola de frames desde cámara
   std::mutex queue_mutex_;
   std::condition_variable cv_;
+  
+  std::deque<FrameData> work_queue_;  // Cola de trabajo para workers
+  std::mutex work_mutex_;
+  std::condition_variable work_cv_;
 };
 
 class HikvisionNodeManager : public rclcpp::Node {
@@ -378,7 +464,6 @@ public:
     ip2_ = this->declare_parameter<std::string>("ip2", "192.168.1.66");
     username_ = this->declare_parameter<std::string>("username", "admin");
     password_ = this->declare_parameter<std::string>("password", "12345");
-    fps_ = this->declare_parameter<double>("fps", 20.0);
     jpeg_quality_ = this->declare_parameter<int>("jpeg_quality", 85);
     use_compressed_ = this->declare_parameter<bool>("use_compressed", true);
   }
@@ -390,17 +475,21 @@ public:
       return;
     }
 
-    NET_DVR_SetLogToFile(3, "/tmp/hikvision_sdk.log", false);
+    // Deshabilitar logs del SDK en consola (nivel 0 = solo errores críticos en archivo)
+    NET_DVR_SetLogToFile(0, "/tmp/hikvision_sdk.log", false);
 
     auto self = this->shared_from_this();
 
     camera1_ = std::make_unique<HikvisionCamera>(
         ip1_, username_, password_, self, "camera_left/image_raw",
-        fps_, jpeg_quality_, use_compressed_, true);
+        jpeg_quality_, use_compressed_, true);
 
     camera2_ = std::make_unique<HikvisionCamera>(
         ip2_, username_, password_, self, "camera_right/image_raw",
-        fps_, jpeg_quality_, use_compressed_, false);
+        jpeg_quality_, use_compressed_, false);
+    
+    RCLCPP_INFO(this->get_logger(), "Hikvision cameras initialized at native FPS (Quality: %d)", 
+                jpeg_quality_);
   }
 
   ~HikvisionNodeManager() {
@@ -411,7 +500,6 @@ private:
   std::unique_ptr<HikvisionCamera> camera1_;
   std::unique_ptr<HikvisionCamera> camera2_;
   std::string ip1_, ip2_, username_, password_;
-  double fps_;
   int jpeg_quality_;
   bool use_compressed_;
 };
