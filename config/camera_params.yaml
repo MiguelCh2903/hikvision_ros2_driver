@@ -1,0 +1,11 @@
+/**:
+  ros__parameters:
+    # === Configuración de red ===
+    ip1: "192.168.196.105"
+    ip2: "192.168.196.104"
+    username: "admin"
+    password: "m6ai-lab"
+    
+    # === Optimización para rosbag ===
+    jpeg_quality: 100          # Calidad JPEG 1-100 (85 = buen balance)
+    use_compressed: false      # true=compressed, false=raw

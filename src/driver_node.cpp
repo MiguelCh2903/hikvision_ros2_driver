@@ -42,11 +42,16 @@ public:
         userID_(-1),
         playHandle_(-1),
         port_(-1),
-        processing_thread_running_(true),
         jpeg_quality_(jpeg_quality),
         use_compressed_(use_compressed),
-        is_left_camera_(is_left_camera) {
+        is_left_camera_(is_left_camera),
+        processing_thread_running_(true) {
 
+    // Extraer nombre base de la cámara y crear frame_id apropiado
+    // De "camera_left/image_raw" -> frame_id = "camera_left"
+    std::string camera_base_name = topic_name.substr(0, topic_name.find("/image_raw"));
+    frame_id_ = camera_base_name;
+    
     // QoS optimizado para rosbag y cero pérdida de paquetes
     // - RELIABLE: garantiza entrega (compatible con RViz2)
     // - History depth 50: buffer grande para absorber picos de tráfico
@@ -67,8 +72,10 @@ public:
       image_pub_ = node_->create_publisher<sensor_msgs::msg::Image>(topic_name, qos);
     }
 
+    // CRÍTICO: camera_info debe publicarse en "camera_*/camera_info", NO en "camera_*/image_raw/camera_info"
+    // Esto permite que RViz2 sincronice correctamente las imágenes comprimidas con el camera_info
     camera_info_pub_ = node_->create_publisher<sensor_msgs::msg::CameraInfo>(
-        topic_name + "/camera_info", qos);
+        camera_base_name + "/camera_info", qos);
 
     // Timer para reportar solo problemas críticos (pérdida por cola llena)
     stats_timer_ = node_->create_wall_timer(
@@ -113,7 +120,7 @@ public:
 
     NET_DVR_CLIENTINFO clientInfo = {};
     clientInfo.lChannel = 1;
-    clientInfo.lLinkMode = 0;
+    clientInfo.lLinkMode = 3;
     clientInfo.hPlayWnd = 0;
 
     // Iniciar thread de procesamiento principal
@@ -277,7 +284,7 @@ private:
   void publishCompressedImage(const cv::Mat &bgr, const rclcpp::Time &stamp) {
     auto msg = std::make_shared<sensor_msgs::msg::CompressedImage>();
     msg->header.stamp = stamp;
-    msg->header.frame_id = "camera_link";
+    msg->header.frame_id = frame_id_;  // Usar frame_id dinámico
     msg->format = "jpeg";
 
     // Buffer thread-local reutilizable para evitar allocations
@@ -300,14 +307,14 @@ private:
   void publishRawImage(const cv::Mat &bgr, const rclcpp::Time &stamp) {
     auto msg = cv_bridge::CvImage(std_msgs::msg::Header(), "bgr8", bgr).toImageMsg();
     msg->header.stamp = stamp;
-    msg->header.frame_id = "camera_link";
+    msg->header.frame_id = frame_id_;  // Usar frame_id dinámico
     image_pub_->publish(*msg);
   }
 
   void publishCameraInfo(int width, int height, const rclcpp::Time &stamp) {
     auto msg = std::make_shared<sensor_msgs::msg::CameraInfo>();
     msg->header.stamp = stamp;
-    msg->header.frame_id = "camera_link";
+    msg->header.frame_id = frame_id_;  // Usar frame_id dinámico
     msg->width = width;
     msg->height = height;
     msg->distortion_model = "plumb_bob";
@@ -373,6 +380,8 @@ private:
   }
 
   static void CALLBACK ExceptionCallback(DWORD dwType, LONG lUserID, LONG lHandle, void *pUser) {
+    (void)lUserID;  // Parámetro no usado pero requerido por callback API
+    (void)lHandle;  // Parámetro no usado pero requerido por callback API
     auto *camera = static_cast<HikvisionCamera *>(pUser);
     RCLCPP_ERROR(camera->node_->get_logger(), "Camera exception: %u", dwType);
   }
@@ -438,6 +447,7 @@ private:
   LONG playHandle_;
   LONG port_;
   
+  std::string frame_id_;  // Frame ID dinámico para cada cámara (ej: "camera_left_optical_frame")
   int jpeg_quality_;
   bool use_compressed_;
   bool is_left_camera_;
@@ -476,7 +486,8 @@ public:
     }
 
     // Deshabilitar logs del SDK en consola (nivel 0 = solo errores críticos en archivo)
-    NET_DVR_SetLogToFile(0, "/tmp/hikvision_sdk.log", false);
+    char log_path[] = "/tmp/hikvision_sdk.log";
+    NET_DVR_SetLogToFile(0, log_path, false);
 
     auto self = this->shared_from_this();
 

@@ -39,6 +39,7 @@ install(TARGETS
 )
 
 install(DIRECTORY launch DESTINATION share/${PROJECT_NAME})
+install(DIRECTORY config DESTINATION share/${PROJECT_NAME})
 
 # Install Hikvision libraries
 install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/third_party/hikvision/lib/
